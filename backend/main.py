@@ -69,6 +69,11 @@ FRONTEND_DIST_DIR = os.getenv(
 )
 
 
+def sse_event(payload: Dict[str, Any]) -> str:
+    """Serialize one SSE event as a complete frame."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
@@ -143,6 +148,25 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
             stage3_result = None
             label_to_model = {}
             aggregate_rankings = {}
+            assistant_saved = False
+
+            def build_metadata(partial: bool = False) -> Dict[str, Any]:
+                metadata = {
+                    "execution_mode": body.execution_mode,
+                }
+
+                if body.execution_mode in ["chat_ranking", "full"]:
+                    metadata["label_to_model"] = label_to_model
+                    metadata["aggregate_rankings"] = aggregate_rankings
+
+                if search_context:
+                    metadata["search_context"] = search_context
+                if search_query:
+                    metadata["search_query"] = search_query
+                if partial:
+                    metadata["partial"] = True
+
+                return metadata
             
             # Add user message
             storage.add_user_message(conversation_id, body.content)
@@ -172,7 +196,7 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
                 if settings.brave_api_key and provider == SearchProvider.BRAVE:
                     os.environ["BRAVE_API_KEY"] = settings.brave_api_key
 
-                yield f"data: {json.dumps({'type': 'search_start', 'data': {'provider': provider.value}})}\n\n"
+                yield sse_event({'type': 'search_start', 'data': {'provider': provider.value}})
 
                 # Check for disconnect before generating search query
                 if await request.is_disconnected():
@@ -199,11 +223,11 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
                 search_context = search_result["results"]
                 extracted_query = search_result["extracted_query"]
                 search_intent = search_result.get("intent", "unknown")
-                yield f"data: {json.dumps({'type': 'search_complete', 'data': {'search_query': search_query, 'extracted_query': extracted_query, 'search_context': search_context, 'provider': provider.value, 'intent': search_intent}})}\n\n"
+                yield sse_event({'type': 'search_complete', 'data': {'search_query': search_query, 'extracted_query': extracted_query, 'search_context': search_context, 'provider': provider.value, 'intent': search_intent}})
                 await asyncio.sleep(0.05)
 
             # Stage 1: Collect responses
-            yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
+            yield sse_event({'type': 'stage1_start'})
             await asyncio.sleep(0.05)
             
             total_models = 0
@@ -212,26 +236,26 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
                 if isinstance(item, int):
                     total_models = item
                     print(f"DEBUG: Sending stage1_init with total={total_models}")
-                    yield f"data: {json.dumps({'type': 'stage1_init', 'total': total_models})}\n\n"
+                    yield sse_event({'type': 'stage1_init', 'total': total_models})
                     continue
                 
                 stage1_results.append(item)
-                yield f"data: {json.dumps({'type': 'stage1_progress', 'data': item, 'count': len(stage1_results), 'total': total_models})}\n\n"
+                yield sse_event({'type': 'stage1_progress', 'data': item, 'count': len(stage1_results), 'total': total_models})
                 await asyncio.sleep(0.01)
 
-            yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
+            yield sse_event({'type': 'stage1_complete', 'data': stage1_results})
             await asyncio.sleep(0.05)
 
             # Check if any models responded successfully in Stage 1
             if not any(r for r in stage1_results if not r.get('error')):
                 error_msg = 'All models failed to respond in Stage 1, likely due to rate limits or API errors. Please try again or adjust your model selection.'
                 storage.add_error_message(conversation_id, error_msg)
-                yield f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
+                yield sse_event({'type': 'error', 'message': error_msg})
                 return # Stop further processing
 
             # Stage 2: Only if mode is 'chat_ranking' or 'full'
             if body.execution_mode in ["chat_ranking", "full"]:
-                yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
+                yield sse_event({'type': 'stage2_start'})
                 await asyncio.sleep(0.05)
                 
                 # Iterate over the async generator
@@ -240,7 +264,7 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
                     if isinstance(item, dict) and not item.get('model'):
                         label_to_model = item
                         # Send init event with total count
-                        yield f"data: {json.dumps({'type': 'stage2_init', 'total': len(label_to_model)})}\n\n"
+                        yield sse_event({'type': 'stage2_init', 'total': len(label_to_model)})
                         continue
                     
                     # Subsequent items are results
@@ -248,16 +272,16 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
                     
                     # Send progress update
                     print(f"Stage 2 Progress: {len(stage2_results)}/{len(label_to_model)} - {item['model']}")
-                    yield f"data: {json.dumps({'type': 'stage2_progress', 'data': item, 'count': len(stage2_results), 'total': len(label_to_model)})}\n\n"
+                    yield sse_event({'type': 'stage2_progress', 'data': item, 'count': len(stage2_results), 'total': len(label_to_model)})
                     await asyncio.sleep(0.01)
 
                 aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-                yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings, 'search_query': search_query, 'search_context': search_context}})}\n\n"
+                yield sse_event({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings, 'search_query': search_query, 'search_context': search_context}})
                 await asyncio.sleep(0.05)
 
             # Stage 3: Only if mode is 'full'
             if body.execution_mode == "full":
-                yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
+                yield sse_event({'type': 'stage3_start'})
                 await asyncio.sleep(0.05)
 
                 # Check for disconnect before starting Stage 3
@@ -266,31 +290,19 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
                     raise asyncio.CancelledError("Client disconnected")
 
                 stage3_result = await stage3_synthesize_final(body.content, stage1_results, stage2_results, search_context)
-                yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
+                yield sse_event({'type': 'stage3_complete', 'data': stage3_result})
 
             # Wait for title generation if it was started
             if title_task:
                 try:
                     title = await title_task
                     storage.update_conversation_title(conversation_id, title)
-                    yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
+                    yield sse_event({'type': 'title_complete', 'data': {'title': title}})
                 except Exception as e:
                     print(f"Error waiting for title task: {e}")
 
             # Save complete assistant message with metadata
-            metadata = {
-                "execution_mode": body.execution_mode,  # Save mode for historical context
-            }
-            
-            # Only include stage2/stage3 metadata if they were executed
-            if body.execution_mode in ["chat_ranking", "full"]:
-                metadata["label_to_model"] = label_to_model
-                metadata["aggregate_rankings"] = aggregate_rankings
-            
-            if search_context:
-                metadata["search_context"] = search_context
-            if search_query:
-                metadata["search_query"] = search_query
+            metadata = build_metadata()
 
             storage.add_assistant_message(
                 conversation_id,
@@ -299,9 +311,10 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
                 stage3_result if body.execution_mode == "full" else None,
                 metadata
             )
+            assistant_saved = True
 
             # Send completion event
-            yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+            yield sse_event({'type': 'complete'})
 
         except asyncio.CancelledError:
             print(f"Stream cancelled for conversation {conversation_id}")
@@ -314,13 +327,22 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
                     print(f"Saved title despite cancellation: {title}")
                 except Exception as e:
                     print(f"Could not save title during cancellation: {e}")
+            if not assistant_saved and (stage1_results or stage2_results or stage3_result):
+                storage.add_assistant_message(
+                    conversation_id,
+                    stage1_results,
+                    stage2_results if body.execution_mode in ["chat_ranking", "full"] else None,
+                    stage3_result if body.execution_mode == "full" else None,
+                    build_metadata(partial=True)
+                )
+                print(f"Saved partial assistant response despite cancellation for conversation {conversation_id}")
             raise
         except Exception as e:
             print(f"Stream error: {e}")
             # Save error to conversation history
             storage.add_error_message(conversation_id, f"Error: {str(e)}")
             # Send error event
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield sse_event({'type': 'error', 'message': str(e)})
 
     return StreamingResponse(
         event_generator(),
