@@ -74,6 +74,15 @@ def sse_event(payload: Dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+async def wait_with_heartbeats(task: asyncio.Task, interval: float = 1.0):
+    """Yield heartbeat markers while a long-running task is still pending."""
+    while not task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+        except asyncio.TimeoutError:
+            yield {"_event": "heartbeat"}
+
+
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
@@ -233,6 +242,10 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
             total_models = 0
             
             async for item in stage1_collect_responses(body.content, search_context, request):
+                if isinstance(item, dict) and item.get('_event') == 'heartbeat':
+                    yield sse_event({'type': 'heartbeat'})
+                    continue
+
                 if isinstance(item, int):
                     total_models = item
                     print(f"DEBUG: Sending stage1_init with total={total_models}")
@@ -260,6 +273,10 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
                 
                 # Iterate over the async generator
                 async for item in stage2_collect_rankings(body.content, stage1_results, search_context, request):
+                    if isinstance(item, dict) and item.get('_event') == 'heartbeat':
+                        yield sse_event({'type': 'heartbeat'})
+                        continue
+
                     # First item is the label mapping
                     if isinstance(item, dict) and not item.get('model'):
                         label_to_model = item
@@ -289,7 +306,12 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
                     print("Client disconnected before Stage 3")
                     raise asyncio.CancelledError("Client disconnected")
 
-                stage3_result = await stage3_synthesize_final(body.content, stage1_results, stage2_results, search_context)
+                stage3_task = asyncio.create_task(stage3_synthesize_final(body.content, stage1_results, stage2_results, search_context))
+                async for item in wait_with_heartbeats(stage3_task):
+                    if item.get('_event') == 'heartbeat':
+                        yield sse_event({'type': 'heartbeat'})
+
+                stage3_result = stage3_task.result()
                 yield sse_event({'type': 'stage3_complete', 'data': stage3_result})
 
             # Wait for title generation if it was started
@@ -350,6 +372,7 @@ async def send_message_stream(conversation_id: str, body: SendMessageRequest, re
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         }
     )
 

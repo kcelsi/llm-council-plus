@@ -150,6 +150,9 @@ async def stage1_collect_responses(user_query: str, search_context: str = "", re
 
             # Wait for the next task to complete (with timeout to check for disconnects)
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED, timeout=1.0)
+            if not done:
+                yield {"_event": "heartbeat"}
+                continue
 
             for task in done:
                 try:
@@ -279,6 +282,9 @@ async def stage2_collect_rankings(
 
             # Wait for the next task to complete (with timeout to check for disconnects)
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED, timeout=1.0)
+            if not done:
+                yield {"_event": "heartbeat"}
+                continue
 
             for task in done:
                 try:

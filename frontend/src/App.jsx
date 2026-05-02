@@ -601,6 +601,9 @@ function App() {
               loadConversations();
               break;
 
+            case 'heartbeat':
+              break;
+
             case 'complete':
               // Stream complete, reload conversations list
               loadConversations();
@@ -650,11 +653,9 @@ function App() {
         return;
       }
       console.error('Failed to send message:', error);
-      // Remove optimistic messages on error
-      setCurrentConversation((prev) => ({
-        ...prev,
-        messages: prev.messages.slice(0, -2),
-      }));
+      // The server may have completed or partially saved the response even if
+      // the browser stream was interrupted by a proxy/network error.
+      await loadConversation(currentConversationId);
       setIsLoading(false);
     } finally {
       // Only clear the controller if this is still the current request
